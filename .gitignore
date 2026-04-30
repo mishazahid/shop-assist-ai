@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Environment files — NEVER commit these (contain API keys)
+.env
+backend/.env
+frontend/.env
+
+# Product data — auto-generated, no need to version
+backend/data/
+
+# Node
+node_modules/
+frontend/node_modules/
+
+# Vite build output
+frontend/dist/
+frontend/.vite/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
