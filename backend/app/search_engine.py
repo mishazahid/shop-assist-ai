@@ -67,9 +67,14 @@ def search_products(
     # Work on a copy so we never mutate the caller's DataFrames
     df = variants_df.copy()
 
-    # Merge product-level descriptions into the variant table for text search
+    # Merge product-level fields into the variant table
     desc_map       = products_df.set_index("product_id")["description"].to_dict()
     df["description"] = df["product_id"].map(desc_map).fillna("")
+
+    # Merge handle so the frontend can build Shopify product page URLs
+    if "handle" in products_df.columns:
+        handle_map  = products_df.set_index("product_id")["handle"].to_dict()
+        df["handle"] = df["product_id"].map(handle_map).fillna("")
 
     # ── Hard filter: in-stock ────────────────────────────────────────────────
     if in_stock_only:
@@ -155,7 +160,223 @@ def search_products(
     display_cols = [
         "product_id", "product_title", "vendor", "category",
         "size", "color", "price", "inventory", "image_url",
-        "description", "tags", "score",
+        "handle", "description", "tags", "score",
+    ]
+    cols = [c for c in display_cols if c in df.columns]
+    return df[cols].head(top_n).reset_index(drop=True)
+
+
+def search_with_fallback(
+    variants_df:           pd.DataFrame,
+    products_df:           pd.DataFrame,
+    keyword:               str   | None = None,
+    vendor:                str   | None = None,
+    category:              str   | None = None,
+    max_price:             float | None = None,
+    size:                  str   | None = None,
+    color:                 str   | None = None,
+    in_stock_only:         bool         = True,
+    top_n:                 int          = 5,
+    semantic_product_ids:  list  | None = None,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Search with automatic progressive filter relaxation.
+
+    Tries up to 5 levels — each level drops one more filter until
+    results are found.  Returns the first non-empty result set.
+
+    Fallback order:
+      Level 0 — all filters (exact match)
+      Level 1 — drop size
+      Level 2 — drop size + color
+      Level 3 — drop size + color + price
+      Level 4 — drop size + color + price + semantic limit (broadest)
+
+    Vendor and category are intentional and never dropped — if the user
+    said "Adidas" we don't silently switch to other brands.
+
+    Returns
+    -------
+    (pd.DataFrame, str)
+      DataFrame : best matching results (up to top_n rows)
+      str       : human-readable description of what was relaxed,
+                  e.g. "size", "size and color", "size, color, and price"
+                  Empty string "" means an exact match was found.
+    """
+
+    # Record which variant filters were originally active
+    had_size  = size  is not None
+    had_color = color is not None
+    had_price = max_price is not None
+
+    def _run(s, c, p, sem_ids):
+        """Thin wrapper so we don't repeat the long argument list."""
+        return search_products(
+            variants_df          = variants_df,
+            products_df          = products_df,
+            keyword              = keyword,
+            vendor               = vendor,
+            category             = category,
+            max_price            = p,
+            size                 = s,
+            color                = c,
+            in_stock_only        = in_stock_only,
+            top_n                = top_n,
+            semantic_product_ids = sem_ids,
+        )
+
+    def _label(drop_size, drop_color, drop_price):
+        """Build a readable string of which filters were relaxed."""
+        parts = []
+        if drop_size  and had_size:  parts.append("size")
+        if drop_color and had_color: parts.append("color")
+        if drop_price and had_price: parts.append("price")
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return parts[0]
+        if len(parts) == 2:
+            return f"{parts[0]} and {parts[1]}"
+        return f"{parts[0]}, {parts[1]}, and {parts[2]}"
+
+    # ── Level 0: exact match (all filters active) ─────────────────────────────
+    df = _run(size, color, max_price, semantic_product_ids)
+    if not df.empty:
+        return df, ""
+
+    # ── Level 1: relax size ───────────────────────────────────────────────────
+    if had_size:
+        print("[search] No results — relaxing size filter.")
+        df = _run(None, color, max_price, semantic_product_ids)
+        if not df.empty:
+            return df, _label(True, False, False)
+
+    # ── Level 2: relax size + color ───────────────────────────────────────────
+    if had_color:
+        print("[search] No results — relaxing size + color filters.")
+        df = _run(None, None, max_price, semantic_product_ids)
+        if not df.empty:
+            return df, _label(True, True, False)
+
+    # ── Level 3: relax size + color + price ───────────────────────────────────
+    if had_price:
+        print("[search] No results — relaxing size + color + price filters.")
+        df = _run(None, None, None, semantic_product_ids)
+        if not df.empty:
+            return df, _label(True, True, True)
+
+    # ── Level 4: top semantic matches — ignore all variant filters ────────────
+    # Also drop the semantic candidate limit so we search the full catalog.
+    # Vendor and category are still kept (user specifically asked for them).
+    print("[search] No results — returning top semantic/keyword matches.")
+    df = _run(None, None, None, None)
+    if not df.empty:
+        return df, "exact match"
+
+    # Nothing at all — return empty so AI can say "sorry, nothing found"
+    return df, "exact match"
+
+
+# ── Vague / recommendation query detection ────────────────────────────────────
+
+_VAGUE_KEYWORDS = {
+    "recommend", "recommendation", "recommendations",
+    "suggest", "suggestion", "suggestions",
+    "popular", "trending",
+    "best seller", "bestsellers", "best sellers",
+    "best", "top picks", "top rated",
+    "anything", "something",
+    "surprise me", "show me something",
+}
+
+
+def is_vague_query(text: str) -> bool:
+    """
+    Return True if the query is a general recommendation / discovery request
+    rather than a specific product search.
+
+    Called before intent extraction so the pipeline can skip hard filters
+    for queries like "recommend something stylish" or "what's popular".
+
+    Examples that return True:
+      "recommend something stylish"
+      "what's popular right now"
+      "suggest something nice"
+      "show me your best products"
+
+    Examples that return False (specific filters present):
+      "black Nike shoes under $100"
+      "Adidas hoodie in size M"
+    """
+    lower = text.lower().strip()
+    return any(kw in lower for kw in _VAGUE_KEYWORDS)
+
+
+def recommend_products(
+    variants_df:          pd.DataFrame,
+    products_df:          pd.DataFrame,
+    semantic_product_ids: list  | None = None,
+    top_n:                int          = 5,
+) -> pd.DataFrame:
+    """
+    Return top recommended products for vague / exploratory queries.
+
+    Skips all hard filters (size, color, price, vendor, category).
+
+    Ranking priority:
+      1. Semantic similarity  — captures the stylistic intent of the query
+         (only when embeddings are available; supplied by the caller)
+      2. Inventory level      — high stock is a proxy for popular/featured items
+      3. Price ascending      — tie-break toward more accessible price points
+
+    Parameters
+    ----------
+    variants_df          : variant-level DataFrame from data_cleaner
+    products_df          : product-level DataFrame from data_cleaner
+    semantic_product_ids : product_ids ordered by semantic similarity, best first.
+                           Pass None to fall back to inventory-only ranking.
+    top_n                : maximum number of results to return
+
+    Returns
+    -------
+    pd.DataFrame with one row per recommended product (best variant selected).
+    """
+    df = variants_df.copy()
+
+    # Merge product-level fields (same as search_products)
+    desc_map = products_df.set_index("product_id")["description"].to_dict()
+    df["description"] = df["product_id"].map(desc_map).fillna("")
+
+    if "handle" in products_df.columns:
+        handle_map = products_df.set_index("product_id")["handle"].to_dict()
+        df["handle"] = df["product_id"].map(handle_map).fillna("")
+
+    # In-stock only — out-of-stock items shouldn't be recommended
+    df = df[df["in_stock"] == True].copy()
+
+    if df.empty:
+        return df
+
+    if semantic_product_ids:
+        # Semantic rank drives order; inventory breaks ties within the same rank
+        rank_map = {pid: rank for rank, pid in enumerate(semantic_product_ids)}
+        df["sem_rank"] = df["product_id"].map(rank_map).fillna(9999).astype(int)
+        df.sort_values(
+            ["sem_rank", "inventory", "price"],
+            ascending=[True, False, True],
+            inplace=True,
+        )
+    else:
+        # No embeddings — rank by inventory (popularity proxy) then price
+        df.sort_values(["inventory", "price"], ascending=[False, True], inplace=True)
+
+    # One best variant per product (already the top row after sorting)
+    df.drop_duplicates(subset=["product_id"], keep="first", inplace=True)
+
+    display_cols = [
+        "product_id", "product_title", "vendor", "category",
+        "size", "color", "price", "inventory", "image_url",
+        "handle", "description", "tags",
     ]
     cols = [c for c in display_cols if c in df.columns]
     return df[cols].head(top_n).reset_index(drop=True)

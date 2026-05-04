@@ -26,9 +26,9 @@ import pandas as pd
 from openai import OpenAI
 from dotenv import load_dotenv
 
-from app.intent_parser     import extract_intent
+from app.intent_parser     import extract_intent, merge_intents
 from app.embedding_service import semantic_search, embeddings_ready
-from app.search_engine     import search_products
+from app.search_engine     import search_with_fallback, is_vague_query, recommend_products
 
 load_dotenv()
 
@@ -40,71 +40,160 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 # ── Step 4: AI reasoning response ─────────────────────────────────────────────
 
 _RECOMMENDATION_SYSTEM = """\
-You are ShopAssist AI, a friendly and knowledgeable shopping assistant for a
-clothing and lifestyle store.
+You are ShopAssist AI, a helpful shopping assistant for a clothing and lifestyle store.
 
 You will receive:
-  - The customer's original shopping question
-  - A list of products currently available in the store
+  1. The customer's original question
+  2. What they were specifically looking for (extracted filters)
+  3. A structured list of matching products with their real attributes
 
-Your job is to write a helpful, friendly response in JSON format with EXACTLY
-these two keys:
+Respond in JSON with EXACTLY these two keys:
 
 {
-  "answer": string,             // 1-3 sentences, friendly and specific
-  "recommendations": [          // one entry per product (up to 4)
+  "answer": string,
+  "recommendations": [
     {
       "product_id": string,
-      "reason":     string      // one sentence explaining why this product fits
+      "reason":     string
     }
   ]
 }
 
-Rules (important — follow these strictly):
-  - ONLY recommend products from the provided list. Never invent products.
-  - Be specific: mention price, color, size, or brand when relevant.
-  - If the list is empty, set recommendations to [] and in the answer field
-    politely explain that nothing matched, then suggest the customer try
-    changing the color, size, price range, or brand.
-  - Keep it conversational and upbeat — like a helpful store assistant.
-  - Return ONLY valid JSON. No markdown code fences, no extra text.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULES FOR "reason" (most important)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Write exactly 1 sentence per product — max 20 words.
+• ONLY use facts from the product data. Never invent color, size, price, or brand.
+• Reference what the customer asked for (color, budget, size, brand).
+• Use this format:
+    "This matches because it's [fact], [fact], and [fact]."
+• Examples:
+    "This matches because it's black, priced at $120 (within your $150 budget), and available in size 9."
+    "Great pick — it's by Adidas as requested, priced at $75, and comes in white."
+    "Fits your budget at $89 and is available in your size (M)."
+• If a filter was relaxed (fallback), honestly say what DOES match:
+    "We don't have this in size 9, but this black Nike shoe is available at $110."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULES FOR "answer"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• 1–2 sentences, friendly and conversational.
+• Mention how many products were found.
+• Do NOT repeat the per-product reasons — just give a brief summary.
+• If the product list is empty, set recommendations to [] and suggest the
+  customer try adjusting color, size, price, or brand.
+
+NEVER:
+  • Recommend a product not in the provided list
+  • Mention attributes (color, size, price, brand) not shown in the product data
+  • Use vague filler like "great option" or "perfect choice" without a real fact
+  • Use markdown inside JSON string values
+
+Return ONLY valid JSON. No code fences, no extra text outside the JSON.
 """
 
 
 def _format_products_for_prompt(results_df: pd.DataFrame) -> str:
     """
-    Serialize the top search results into a compact text block so the
-    AI can read and reason about them.
+    Serialize the top search results into clearly labeled blocks.
+
+    Using a labeled format (name:, brand:, price:, etc.) helps the AI
+    reference exact attribute values rather than paraphrasing.
     """
     if results_df.empty:
         return "No matching products found in the catalog."
 
-    lines = []
-    for _, row in results_df.head(5).iterrows():
-        price    = f"${float(row.get('price', 0)):.2f}"
-        attrs    = []
-        if row.get("size"):  attrs.append(f"size {row['size']}")
-        if row.get("color"): attrs.append(f"color {row['color']}")
-        attr_str = ", ".join(attrs)
+    blocks = []
+    for i, (_, row) in enumerate(results_df.head(5).iterrows(), start=1):
+        price     = float(row.get("price", 0))
+        inventory = int(row.get("inventory", 0) or 0)
+        color     = row.get("color") or ""
+        size      = row.get("size")  or ""
 
-        lines.append(
-            f"  product_id={row['product_id']} | "
-            f"{row['product_title']} by {row['vendor']} | "
-            f"{price} | stock: {row.get('inventory', 0)}"
-            + (f" | {attr_str}" if attr_str else "")
-        )
+        lines = [f"Product {i}:"]
+        lines.append(f"  product_id : {row['product_id']}")
+        lines.append(f"  name       : {row.get('product_title', 'Unknown')}")
+        lines.append(f"  brand      : {row.get('vendor', 'Unknown')}")
+        lines.append(f"  category   : {row.get('category', '') or 'N/A'}")
+        lines.append(f"  price      : ${price:.2f}")
+        if color: lines.append(f"  color      : {color}")
+        if size:  lines.append(f"  size       : {size}")
+        lines.append(f"  stock      : {'In stock' if inventory > 0 else 'Out of stock'} ({inventory} units)")
 
-    return "\n".join(lines)
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
 
 
-def generate_recommendation(user_query: str, results_df: pd.DataFrame) -> dict:
+def _build_fallback_reason(row: pd.Series, intent: dict) -> str:
+    """
+    Generate a data-driven reason string from actual product attributes
+    without calling OpenAI — used when the AI API call fails.
+
+    Compares what the customer asked for (intent) with what the product has.
+    """
+    parts = []
+
+    # Color match
+    color     = row.get("color") or ""
+    wanted_c  = (intent.get("color") or "").lower()
+    if color:
+        if wanted_c and wanted_c in color.lower():
+            parts.append(f"it's {color} as you requested")
+        else:
+            parts.append(f"available in {color}")
+
+    # Price match
+    price     = float(row.get("price", 0))
+    max_price = intent.get("max_price")
+    if max_price and price <= max_price:
+        parts.append(f"priced at ${price:.2f} (within your ${max_price:.0f} budget)")
+    else:
+        parts.append(f"priced at ${price:.2f}")
+
+    # Size match
+    size     = row.get("size") or ""
+    wanted_s = (intent.get("size") or "").lower()
+    if size and wanted_s and wanted_s in size.lower():
+        parts.append(f"available in size {size}")
+    elif size:
+        parts.append(f"comes in size {size}")
+
+    # Brand match
+    vendor    = row.get("vendor") or ""
+    wanted_v  = (intent.get("vendor") or "").lower()
+    if vendor and wanted_v and wanted_v in vendor.lower():
+        parts.append(f"by {vendor} as requested")
+
+    if not parts:
+        return "Matches your search criteria."
+
+    if len(parts) == 1:
+        return f"This matches because {parts[0]}."
+    return "This matches because " + ", ".join(parts[:-1]) + f", and {parts[-1]}."
+
+
+def generate_recommendation(
+    user_query:        str,
+    results_df:        pd.DataFrame,
+    fallback_note:     str        = "",
+    intent:            dict | None = None,
+    is_recommendation: bool        = False,
+) -> dict:
     """
     Call OpenAI to write a structured, reasoning-based recommendation.
 
     Parameters
     ----------
-    user_query  : the customer's original message
-    results_df  : DataFrame of products found by the search engine
+    user_query        : the customer's original message
+    results_df        : DataFrame of products found by the search engine
+    fallback_note     : describes which filters were relaxed (empty = exact match)
+    intent            : structured filters extracted from the query — passed so the
+                        AI knows exactly what the customer was looking for and can
+                        write targeted, factual reasons for each product
+    is_recommendation : True when the query was vague (e.g. "recommend something").
+                        Tells the AI to frame results as popular/curated picks
+                        rather than filter-matched results.
 
     Returns
     -------
@@ -114,11 +203,50 @@ def generate_recommendation(user_query: str, results_df: pd.DataFrame) -> dict:
     """
     products_text = _format_products_for_prompt(results_df)
 
-    # Build the user message: query + what the catalog returned
-    user_content = (
-        f"Customer question: {user_query}\n\n"
-        f"Available matching products:\n{products_text}"
+    # Tell the AI what the customer was specifically looking for.
+    # This lets it write reasons like "matches your black color preference"
+    # or "falls within your $150 budget" using the customer's own words.
+    intent_lines = []
+    if intent:
+        if intent.get("keyword"):   intent_lines.append(f"  keyword  : {intent['keyword']}")
+        if intent.get("vendor"):    intent_lines.append(f"  brand    : {intent['vendor']}")
+        if intent.get("category"):  intent_lines.append(f"  category : {intent['category']}")
+        if intent.get("color"):     intent_lines.append(f"  color    : {intent['color']}")
+        if intent.get("size"):      intent_lines.append(f"  size     : {intent['size']}")
+        if intent.get("max_price"): intent_lines.append(f"  budget   : under ${intent['max_price']:.0f}")
+
+    intent_block = (
+        "Customer was looking for:\n" + "\n".join(intent_lines)
+        if intent_lines else ""
     )
+
+    # Build the full user message for the AI
+    user_content = f"Customer question: {user_query}\n\n"
+    if intent_block:
+        user_content += f"{intent_block}\n\n"
+    user_content += f"Matching products:\n{products_text}"
+
+    # Framing instructions for special modes
+    if is_recommendation:
+        user_content += (
+            "\n\nNote: The customer asked for general recommendations, not a "
+            "specific filtered search. Present these as popular or curated picks. "
+            "Start your answer with a friendly intro such as: "
+            "'Here are some popular products you might love!' or "
+            "'Here are my top picks for you today!'"
+        )
+    elif fallback_note == "exact match":
+        user_content += (
+            "\n\nNote: No exact match was found. These are the closest alternatives. "
+            "Start your answer with: 'We couldn't find an exact match, "
+            "but here are some similar options you might like.'"
+        )
+    elif fallback_note:
+        user_content += (
+            f"\n\nNote: No exact match was found for the {fallback_note} filter. "
+            f"It was relaxed to find these alternatives. "
+            f"Start your answer by briefly acknowledging this."
+        )
 
     response = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -147,10 +275,11 @@ def generate_recommendation(user_query: str, results_df: pd.DataFrame) -> dict:
 # ── High-level pipeline ────────────────────────────────────────────────────────
 
 def ask_assistant(
-    user_message: str,
-    variants_df:  pd.DataFrame,
-    products_df:  pd.DataFrame,
-    top_n:        int = 5,
+    user_message:    str,
+    variants_df:     pd.DataFrame,
+    products_df:     pd.DataFrame,
+    top_n:           int          = 5,
+    previous_intent: dict | None  = None,
 ) -> dict:
     """
     Full AI pipeline: understand → search → reason → respond.
@@ -175,7 +304,6 @@ def ask_assistant(
     try:
         intent = extract_intent(user_message)
     except Exception as e:
-        # If intent extraction fails completely, treat the whole message as keyword
         print(f"[assistant] Intent extraction failed ({e}), using raw query as keyword.")
         intent = {
             "keyword":   user_message,
@@ -186,7 +314,31 @@ def ask_assistant(
             "max_price": None,
         }
 
-    print(f"[assistant] Intent: {intent}")
+    # ── Step 1b: Merge with previous turn's intent ────────────────────────────
+    # Only fields mentioned in the new query override the previous values.
+    # Fields not mentioned (None in new intent) are carried over from memory.
+    # Example: previous={color:"black", category:"shoes"}, new={max_price:100}
+    #          merged  ={color:"black", category:"shoes",  max_price:100}
+    if previous_intent:
+        intent = merge_intents(previous_intent, intent)
+        print(f"[assistant] Merged intent (previous + new): {intent}")
+    else:
+        print(f"[assistant] Intent: {intent}")
+
+    # ── Step 1c: Detect recommendation / discovery mode ──────────────────────
+    # Triggered when the query is vague (e.g. "recommend something stylish")
+    # AND no specific product attributes were extracted from it.
+    # When active, strict filters are skipped entirely — results are ranked by
+    # semantic similarity and inventory instead of filter matching.
+    use_recommendation_mode = is_vague_query(user_message) and not any([
+        intent.get("vendor"),
+        intent.get("category"),
+        intent.get("color"),
+        intent.get("size"),
+        intent.get("max_price"),
+    ])
+    if use_recommendation_mode:
+        print("[assistant] Recommendation mode — skipping strict filters, ranking by popularity/semantics.")
 
     # ── Step 2: Semantic search — get candidate product IDs ─────────────────
     semantic_ids = []
@@ -198,27 +350,21 @@ def ask_assistant(
         except Exception as e:
             print(f"[assistant] Semantic search failed ({e}), falling back to keyword.")
 
-    # ── Step 3: Apply hard filters on the semantic candidates ────────────────
-    results_df = search_products(
-        variants_df          = variants_df,
-        products_df          = products_df,
-        keyword              = intent.get("keyword"),
-        vendor               = intent.get("vendor"),
-        category             = intent.get("category"),
-        max_price            = intent.get("max_price"),
-        size                 = intent.get("size"),
-        color                = intent.get("color"),
-        in_stock_only        = True,
-        top_n                = top_n,
-        semantic_product_ids = semantic_ids if semantic_ids else None,
-    )
-
-    # ── Step 3b: Fallback — if semantic + filters returned nothing ───────────
-    # Try again without limiting to semantic candidates.
-    # This handles cases where the semantic match was too strict.
-    if results_df.empty and semantic_ids:
-        print("[assistant] No results with semantic ranking — retrying with keyword search.")
-        results_df = search_products(
+    # ── Step 3: Search ────────────────────────────────────────────────────────
+    fallback_note = ""
+    if use_recommendation_mode:
+        # Skip all hard filters — rank by semantic similarity + inventory
+        results_df = recommend_products(
+            variants_df          = variants_df,
+            products_df          = products_df,
+            semantic_product_ids = semantic_ids if semantic_ids else None,
+            top_n                = top_n,
+        )
+        print(f"[assistant] Recommendation search returned {len(results_df)} products.")
+    else:
+        # Standard search with progressive filter relaxation
+        # Tries: all filters → no size → no color → no price → pure semantic/keyword
+        results_df, fallback_note = search_with_fallback(
             variants_df          = variants_df,
             products_df          = products_df,
             keyword              = intent.get("keyword"),
@@ -229,28 +375,38 @@ def ask_assistant(
             color                = intent.get("color"),
             in_stock_only        = True,
             top_n                = top_n,
-            semantic_product_ids = None,   # keyword-only fallback
+            semantic_product_ids = semantic_ids if semantic_ids else None,
         )
+        if fallback_note:
+            print(f"[assistant] Fallback used — relaxed: {fallback_note}")
 
     print(f"[assistant] Search returned {len(results_df)} products.")
 
     # ── Step 4: Generate AI reasoning response ──────────────────────────────
     try:
-        ai_response = generate_recommendation(user_message, results_df)
+        # Pass intent so the AI can write targeted, factual reasons for each product
+        ai_response = generate_recommendation(
+            user_query         = user_message,
+            results_df         = results_df,
+            fallback_note      = fallback_note,
+            intent             = intent,
+            is_recommendation  = use_recommendation_mode,
+        )
     except Exception as e:
-        # If OpenAI call fails, return the raw search results with a generic message
+        # If the OpenAI call fails, generate data-driven reasons without AI
         print(f"[assistant] Recommendation generation failed ({e}), using fallback response.")
         ai_response = {
             "answer": (
                 "Here are some products that match your search."
                 if not results_df.empty
                 else "I couldn't find anything matching that description. "
-                     "Try changing the color, size, or price range."
+                     "Try adjusting the color, size, price, or brand."
             ),
             "recommendations": [
                 {
                     "product_id": str(row["product_id"]),
-                    "reason":     "Matches your search criteria.",
+                    # Use actual product attributes to build the reason — no AI needed
+                    "reason": _build_fallback_reason(row, intent),
                 }
                 for _, row in results_df.head(top_n).iterrows()
             ] if not results_df.empty else [],
@@ -280,4 +436,6 @@ def ask_assistant(
         "message":         answer,              # alias to satisfy new API spec
         "products":        enriched_products,   # full product objects for product cards
         "recommendations": ai_response.get("recommendations", []),
+        "fallback_used":   fallback_note != "", # True if filters were relaxed
+        "_intent":         intent,              # final merged intent — saved to session by main.py
     }

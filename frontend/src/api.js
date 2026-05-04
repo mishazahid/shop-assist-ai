@@ -32,6 +32,15 @@ export function checkHealth() {
 }
 
 /**
+ * Fetch autocomplete suggestion terms (categories, brands, combinations).
+ * Call once on mount — no per-keystroke requests needed.
+ * @returns {Promise<{terms: string[]}>}
+ */
+export function fetchSuggestions() {
+  return apiFetch('/autocomplete')
+}
+
+/**
  * Trigger a Shopify product sync.
  * Fetches all products from Shopify, cleans them, and saves CSVs.
  */
@@ -71,12 +80,35 @@ export function searchProducts(params) {
 /**
  * Send a chat message to the AI assistant.
  *
- * @param {string} message  — customer's natural-language question
+ * @param {string}      message    — customer's natural-language question
+ * @param {string|null} sessionId  — stable ID for this browser session;
+ *                                   enables multi-turn conversation memory
  * @returns {Promise<{answer: string, products: object[], recommendations: object[]}>}
  */
-export function sendChat(message) {
+export function sendChat(message, sessionId = null) {
   return apiFetch('/chat', {
     method: 'POST',
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, session_id: sessionId }),
+  })
+}
+
+/**
+ * Add a product variant to the Shopify cart.
+ *
+ * Routes through the FastAPI backend so there are no CORS issues in
+ * development.  In a Shopify theme context the backend proxy can be
+ * swapped for a direct call to /cart/add.js on the storefront.
+ *
+ * @param {string|number} variantId  — Shopify variant ID
+ * @param {number}        quantity   — how many to add (default 1)
+ * @returns {Promise<object>}  Shopify cart response
+ */
+export function addToCart(variantId, quantity = 1) {
+  return apiFetch('/cart/add', {
+    method: 'POST',
+    body: JSON.stringify({
+      variant_id: Number(variantId),
+      quantity,
+    }),
   })
 }

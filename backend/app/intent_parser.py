@@ -126,6 +126,31 @@ Rules:
 
 # ── Main function ──────────────────────────────────────────────────────────────
 
+def merge_intents(previous: dict, new: dict) -> dict:
+    """
+    Combine a previous intent with a newly extracted one.
+
+    Rule: only override a field if the new query explicitly mentioned it
+    (i.e. the field is not None in `new`).  Fields the user didn't mention
+    in the follow-up are kept from the previous turn.
+
+    Examples
+    --------
+    previous = {color: "black", category: "shoes", max_price: None}
+    new      = {max_price: 100,  everything else: None}
+    merged   = {color: "black", category: "shoes", max_price: 100}
+
+    previous = {color: "black", category: "shoes"}
+    new      = {color: "white", category: "shoes"}
+    merged   = {color: "white", category: "shoes"}   ← user changed color
+    """
+    merged = previous.copy()
+    for key, value in new.items():
+        if value is not None:          # only override fields the user mentioned
+            merged[key] = value
+    return merged
+
+
 def extract_intent(user_query: str) -> dict:
     """
     Parse a customer's natural-language query into structured search filters.

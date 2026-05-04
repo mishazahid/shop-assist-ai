@@ -6,7 +6,7 @@
  */
 
 import { useState, useRef, useEffect } from 'react'
-import { sendChat } from '../api'
+import { sendChat, fetchSuggestions } from '../api'
 import ProductCard from './ProductCard'
 
 // ── Styles ────────────────────────────────────────────────────────────────────
@@ -83,14 +83,12 @@ const s = {
     whiteSpace: 'pre-wrap',
   }),
 
-  // ── Product card row (horizontal scroll) ────────────────────────────────
-  productRow: {
-    display: 'flex',
-    gap: '12px',
-    overflowX: 'auto',
-    paddingBottom: '4px',
-    maxWidth: 'min(calc(100vw - 80px), 700px)',
-    scrollbarWidth: 'thin',
+  // ── Product card grid (2-column responsive) ─────────────────────────────
+  productGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(2, 1fr)',
+    gap: '10px',
+    width: '100%',
   },
 
   // ── Typing indicator ─────────────────────────────────────────────────────
@@ -130,6 +128,28 @@ const s = {
     background: '#f9fafb',
     transition: 'border-color 0.15s',
   },
+  // ── Autocomplete dropdown ────────────────────────────────────────────────
+  dropdown: {
+    position:     'absolute',
+    bottom:       'calc(100% + 4px)',  // float above the input, 4px gap
+    left:         0,
+    right:        0,
+    background:   '#ffffff',
+    border:       '1px solid #e5e7eb',
+    borderRadius: '10px',
+    boxShadow:    '0 -4px 16px rgba(0,0,0,0.08)',
+    overflow:     'hidden',
+    zIndex:       20,
+  },
+  dropdownItem: {
+    padding:    '9px 14px',
+    fontSize:   '13px',
+    color:      '#374151',
+    cursor:     'pointer',
+    transition: 'background 0.1s',
+    userSelect: 'none',
+  },
+
   sendBtn: {
     width: '40px',
     height: '40px',
@@ -215,16 +235,62 @@ export default function ChatWidget() {
   const bottomRef               = useRef(null)
   const inputRef                = useRef(null)
 
+  // Autocomplete
+  const [acTerms,       setAcTerms]       = useState([])   // full list, loaded once
+  const [dropdownItems, setDropdownItems] = useState([])   // filtered for current input
+  const [showDropdown,  setShowDropdown]  = useState(false)
+
+  // Stable session ID — generated once per page load, never changes.
+  // Sent with every /chat request so the backend can merge follow-up intents.
+  const sessionId = useRef(
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : Math.random().toString(36).slice(2) + Date.now().toString(36)
+  )
+
   // Auto-scroll to the latest message
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, loading])
+
+  // Load autocomplete terms once on mount — silent fail, it's an enhancement only
+  useEffect(() => {
+    fetchSuggestions()
+      .then(data => setAcTerms(data.terms || []))
+      .catch(() => {})
+  }, [])
+
+  const handleInputChange = (e) => {
+    const val = e.target.value
+    setInput(val)
+
+    const trimmed = val.trim()
+    if (trimmed.length < 2) {
+      setShowDropdown(false)
+      return
+    }
+
+    const lower = trimmed.toLowerCase()
+    const matches = acTerms
+      .filter(t => t.toLowerCase().includes(lower))
+      .slice(0, 6)
+
+    setDropdownItems(matches)
+    setShowDropdown(matches.length > 0)
+  }
+
+  const handleSuggestionClick = (term) => {
+    setInput(term)
+    setShowDropdown(false)
+    inputRef.current?.focus()
+  }
 
   const handleSend = async (text) => {
     const msg = (text || input).trim()
     if (!msg || loading) return
 
     setInput('')
+    setShowDropdown(false)
     setError(null)
 
     // Add user message to chat
@@ -232,7 +298,7 @@ export default function ChatWidget() {
     setLoading(true)
 
     try {
-      const data = await sendChat(msg)
+      const data = await sendChat(msg, sessionId.current)
       // Add assistant response (with optional product cards)
       setMessages((prev) => [
         ...prev,
@@ -252,6 +318,10 @@ export default function ChatWidget() {
   }
 
   const handleKeyDown = (e) => {
+    if (e.key === 'Escape') {
+      setShowDropdown(false)
+      return
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       handleSend()
@@ -287,11 +357,11 @@ export default function ChatWidget() {
               Ask me to find products by style, color, size, or budget.
             </div>
             <div style={s.chips}>
-              {SUGGESTIONS.map((s) => (
+              {SUGGESTIONS.map((suggestion) => (
                 <button
-                  key={s}
-                  style={styles.chip}
-                  onClick={() => handleSend(s)}
+                  key={suggestion}
+                  style={s.chip}
+                  onClick={() => handleSend(suggestion)}
                   onMouseEnter={(e) => {
                     e.target.style.borderColor = '#008060'
                     e.target.style.background  = '#f0fdf9'
@@ -301,7 +371,7 @@ export default function ChatWidget() {
                     e.target.style.background  = '#ffffff'
                   }}
                 >
-                  {s}
+                  {suggestion}
                 </button>
               ))}
             </div>
@@ -314,7 +384,7 @@ export default function ChatWidget() {
 
               {/* Product cards (AI messages only) */}
               {msg.role === 'assistant' && msg.products?.length > 0 && (
-                <div style={s.productRow}>
+                <div style={s.productGrid}>
                   {msg.products.map((product, j) => (
                     <ProductCard key={product.variant_id || product.product_id || j} product={product} />
                   ))}
@@ -360,17 +430,42 @@ export default function ChatWidget() {
 
       {/* Input bar */}
       <div style={s.inputBar}>
-        <input
-          ref={inputRef}
-          style={s.input}
-          type="text"
-          placeholder="Ask about products, sizes, colors, budget…"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          disabled={loading}
-          autoFocus
-        />
+        {/* Wrapper gives the dropdown an anchor point */}
+        <div style={{ position: 'relative', flex: 1 }}>
+          {/* Autocomplete dropdown — floats above the input */}
+          {showDropdown && dropdownItems.length > 0 && (
+            <div style={s.dropdown}>
+              {dropdownItems.map((term, i) => (
+                <div
+                  key={i}
+                  style={s.dropdownItem}
+                  onMouseDown={(e) => {
+                    // preventDefault keeps focus on the input so blur doesn't
+                    // fire before the click is registered
+                    e.preventDefault()
+                    handleSuggestionClick(term)
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = '#f0fdf9' }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}
+                >
+                  {term}
+                </div>
+              ))}
+            </div>
+          )}
+          <input
+            ref={inputRef}
+            style={s.input}
+            type="text"
+            placeholder="Ask about products, sizes, colors, budget…"
+            value={input}
+            onChange={handleInputChange}
+            onKeyDown={handleKeyDown}
+            onBlur={() => setShowDropdown(false)}
+            disabled={loading}
+            autoFocus
+          />
+        </div>
         <button
           style={{
             ...s.sendBtn,
@@ -387,5 +482,3 @@ export default function ChatWidget() {
   )
 }
 
-// Give access to styles inside the component (for suggestion chips)
-const styles = s

@@ -10,6 +10,7 @@ Endpoints:
   GET  /variants        — return all variants from CSV
   POST /search          — search products with structured filters
   POST /chat            — AI-powered natural-language shopping assistant
+  POST /cart/add        — add a variant to the Shopify cart (proxy)
 
 Run locally:
   cd backend
@@ -20,6 +21,8 @@ import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import time
+import requests as http_requests   # renamed to avoid collision with FastAPI
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,7 +34,10 @@ from app.data_cleaner      import (
     clean_products, clean_variants,
     save_to_csv, load_from_csv, csv_exists,
 )
-from app.search_engine     import search_products
+from app.search_engine     import (
+    search_products,
+    get_all_vendors, get_all_categories, get_all_colors,
+)
 from app.ai_assistant      import ask_assistant
 from app.embedding_service import build_product_embeddings   # NEW: semantic search index
 
@@ -42,6 +48,36 @@ load_dotenv()
 # Call GET /sync-products to refresh them from Shopify.
 _products_df: pd.DataFrame = pd.DataFrame()
 _variants_df: pd.DataFrame = pd.DataFrame()
+
+# ── Conversation memory (per session) ──────────────────────────────────────────
+# Maps session_id → {intent: dict, last_active: float}
+# Intent is the last merged set of search filters for that session.
+# This lets follow-up messages like "under $100" remember the previous context.
+_sessions: dict[str, dict] = {}
+SESSION_TTL  = 3600   # seconds — sessions expire after 1 hour of inactivity
+MAX_SESSIONS = 500    # cap to prevent unbounded memory growth
+
+
+def _get_session_intent(session_id: str) -> dict | None:
+    """Return the stored intent for a session, or None if expired / not found."""
+    session = _sessions.get(session_id)
+    if not session:
+        return None
+    if time.time() - session["last_active"] > SESSION_TTL:
+        del _sessions[session_id]
+        return None
+    return session["intent"]
+
+
+def _save_session_intent(session_id: str, intent: dict) -> None:
+    """Persist the latest merged intent for a session."""
+    # Evict the oldest session if we're at capacity
+    if len(_sessions) >= MAX_SESSIONS and session_id not in _sessions:
+        oldest = min(_sessions, key=lambda k: _sessions[k]["last_active"])
+        del _sessions[oldest]
+        print(f"[session] Evicted oldest session to stay under {MAX_SESSIONS} limit.")
+
+    _sessions[session_id] = {"intent": intent, "last_active": time.time()}
 
 
 def _load_data() -> None:
@@ -117,7 +153,14 @@ class SearchRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     """Body for POST /chat."""
-    message: str
+    message:    str
+    session_id: str | None = None   # optional — enables multi-turn conversation memory
+
+
+class CartAddRequest(BaseModel):
+    """Body for POST /cart/add."""
+    variant_id: int    # Shopify numeric variant ID
+    quantity:   int = 1
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -133,6 +176,44 @@ def health():
         "products": len(_products_df),
         "variants": len(_variants_df),
     }
+
+
+@app.get("/autocomplete")
+def autocomplete():
+    """
+    Return a flat list of suggestion terms for the chat input autocomplete.
+
+    Combines product categories, brand names, colors, and common phrase
+    combinations (e.g. "black shoes", "Nike hoodies").
+
+    Called once when the frontend loads — no per-keystroke network requests.
+    """
+    if _variants_df.empty:
+        return {"terms": []}
+
+    vendors    = get_all_vendors(_variants_df)[:20]
+    categories = get_all_categories(_variants_df)[:20]
+    colors     = get_all_colors(_variants_df)[:12]
+
+    terms: set[str] = set()
+
+    # Standalone categories and brands
+    for cat in categories:
+        terms.add(cat.lower())
+    for vendor in vendors:
+        terms.add(vendor)
+
+    # color + category combinations: "black shoes", "red dress"
+    for color in colors[:8]:
+        for cat in categories[:8]:
+            terms.add(f"{color.lower()} {cat.lower()}")
+
+    # vendor + category combinations: "Nike shoes", "Adidas hoodie"
+    for vendor in vendors[:8]:
+        for cat in categories[:8]:
+            terms.add(f"{vendor} {cat.lower()}")
+
+    return {"terms": sorted(terms)}
 
 
 @app.get("/sync-products")
@@ -262,16 +343,79 @@ def chat(req: ChatRequest):
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
+    # Look up the previous intent for this session (if any)
+    previous_intent = None
+    if req.session_id:
+        previous_intent = _get_session_intent(req.session_id)
+        if previous_intent:
+            print(f"[session] Loaded previous intent for {req.session_id[:8]}…: {previous_intent}")
+        else:
+            print(f"[session] New session: {req.session_id[:8]}…")
+
     try:
         result = ask_assistant(
-            user_message = req.message,
-            variants_df  = _variants_df,
-            products_df  = _products_df,
-            top_n        = 5,
+            user_message    = req.message,
+            variants_df     = _variants_df,
+            products_df     = _products_df,
+            top_n           = 5,
+            previous_intent = previous_intent,
         )
+
+        # Save the merged intent back to session memory for the next turn
+        if req.session_id and result.get("_intent"):
+            _save_session_intent(req.session_id, result["_intent"])
+
+        # Strip the internal _intent field before sending to the frontend
+        result.pop("_intent", None)
         return result
 
     except Exception as exc:
-        # Log the full error on the server but return a clean message to the user
         print(f"[chat] Unhandled error: {exc}")
         raise HTTPException(status_code=500, detail="Something went wrong. Please try again.")
+
+
+@app.post("/cart/add")
+def cart_add(req: CartAddRequest):
+    """
+    Proxy — adds a product variant to the Shopify cart.
+
+    Forwards the request to Shopify's AJAX Cart API on the storefront.
+    Using a backend proxy avoids CORS issues during development.
+
+    Note: Shopify's AJAX cart is session-based (browser cookie).
+    For full session continuity, embed this app inside a Shopify theme
+    and call POST /cart/add.js directly from the frontend instead.
+    The backend proxy is the correct approach for standalone / headless use.
+    """
+    store_domain = os.getenv("SHOPIFY_STORE_DOMAIN", "")
+    if not store_domain:
+        raise HTTPException(
+            status_code=500,
+            detail="SHOPIFY_STORE_DOMAIN is not configured in the backend .env file.",
+        )
+
+    shopify_url = f"https://{store_domain}/cart/add.js"
+
+    try:
+        resp = http_requests.post(
+            shopify_url,
+            json={"id": req.variant_id, "quantity": req.quantity},
+            headers={
+                "Content-Type": "application/json",
+                "Accept":       "application/json",
+            },
+            timeout=10,
+        )
+    except http_requests.RequestException as exc:
+        print(f"[cart] Network error reaching Shopify: {exc}")
+        raise HTTPException(status_code=502, detail="Could not reach the Shopify store.")
+
+    # Shopify returns 200 on success, 422 on invalid variant / out of stock
+    if not resp.ok:
+        error_body = resp.json() if resp.content else {}
+        message    = error_body.get("description") or error_body.get("message") or "Failed to add to cart."
+        print(f"[cart] Shopify rejected add-to-cart: {resp.status_code} — {message}")
+        raise HTTPException(status_code=resp.status_code, detail=message)
+
+    print(f"[cart] Added variant {req.variant_id} × {req.quantity} to cart.")
+    return resp.json()
