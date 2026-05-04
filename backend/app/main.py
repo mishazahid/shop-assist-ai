@@ -98,19 +98,40 @@ def _load_data() -> None:
 async def lifespan(app: FastAPI):
     """
     Runs once when the server starts.
-    1. Load CSV data into memory
-    2. Build semantic embeddings for all products (if data is available)
+    1. Load CSV data into memory (if it exists)
+    2. Auto-sync from Shopify if no CSV is found (e.g. after a Railway restart)
+    3. Build semantic embeddings for all products
     """
+    global _products_df, _variants_df
+
     _load_data()
 
-    # Build the semantic search index so queries like "casual summer shoes"
-    # work out of the box — even without exact keyword matches.
+    # Railway has ephemeral storage — the CSV is gone on every restart.
+    # Auto-sync from Shopify so the widget works without manual intervention.
+    if _products_df.empty:
+        shopify_domain = os.getenv("SHOPIFY_STORE_DOMAIN", "")
+        shopify_token  = os.getenv("SHOPIFY_ACCESS_TOKEN", "")
+        if shopify_domain and shopify_token:
+            print("[startup] No CSV found — auto-syncing from Shopify…")
+            try:
+                raw          = fetch_all_products()
+                _products_df = clean_products(raw)
+                _variants_df = clean_variants(raw)
+                save_to_csv(_products_df, _variants_df)
+                print(
+                    f"[startup] Auto-sync complete: "
+                    f"{len(_products_df)} products, {len(_variants_df)} variants."
+                )
+            except Exception as exc:
+                print(f"[startup] Auto-sync failed: {exc}")
+        else:
+            print("[startup] Shopify credentials not configured — skipping auto-sync.")
+
     if not _products_df.empty:
         print("[startup] Building semantic embeddings…")
         build_product_embeddings(_products_df)
     else:
-        print("[startup] No products loaded — skipping embedding build.")
-        print("[startup] Call GET /sync-products to fetch products from Shopify.")
+        print("[startup] No products available. Call GET /sync-products to load data.")
 
     yield   # Server is now running — yield until shutdown
 
