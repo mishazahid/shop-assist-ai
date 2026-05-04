@@ -123,15 +123,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Allow the React dev server to call this backend without CORS errors
+# Allow requests from any origin (covers Vercel, local dev, and custom domains)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",   # Vite default port
-        "http://localhost:3000",   # Create React App / other
-        "http://127.0.0.1:5173",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
