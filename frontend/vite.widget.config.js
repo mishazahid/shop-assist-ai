@@ -28,6 +28,7 @@ export default defineConfig({
       // The script tag on Shopify has no access to any npm packages.
       external: [],
       output: {
+        entryFileNames: 'widget.js',   // explicit: Vite 5 IIFE default is widget.iife.js
         inlineDynamicImports: true,
         assetFileNames: 'widget[extname]',
       },
