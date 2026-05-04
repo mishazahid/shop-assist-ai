@@ -31,7 +31,18 @@ export default function ProductCard({ product }) {
 
   // ── Add to Cart ───────────────────────────────────────────────────────────
   const handleAddToCart = async () => {
-    if (!inStock || !product.variant_id || cartState === 'loading') return
+    if (!inStock || cartState === 'loading') return
+
+    // In standalone mode (not embedded in a Shopify theme), the backend cart
+    // proxy creates a server-side session the browser can't use. Redirect to
+    // the Shopify product page so the customer can add to cart there instead.
+    if (productUrl) {
+      window.open(productUrl, '_blank', 'noopener,noreferrer')
+      return
+    }
+
+    // Fallback: try the backend proxy (works when embedded in Shopify theme)
+    if (!product.variant_id) return
     setCartState('loading')
     setErrorMsg('')
     try {
@@ -46,8 +57,8 @@ export default function ProductCard({ product }) {
   }
 
   const btnLabel = {
-    idle:    inStock ? 'Add to Cart' : 'Out of Stock',
-    loading: 'Adding…',
+    idle:    inStock ? (productUrl ? 'Buy on Shopify →' : 'Add to Cart') : 'Out of Stock',
+    loading: 'Opening…',
     success: '✓ Added!',
     error:   'Try Again',
   }[cartState]
