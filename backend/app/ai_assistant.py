@@ -28,7 +28,10 @@ from dotenv import load_dotenv
 
 from app.intent_parser     import extract_intent, merge_intents
 from app.embedding_service import semantic_search, embeddings_ready
-from app.search_engine     import search_with_fallback, is_vague_query, recommend_products
+from app.search_engine     import (
+    search_with_fallback, is_vague_query, recommend_products,
+    is_compare_query, is_size_guide_query, is_related_query, is_budget_query,
+)
 
 load_dotenv()
 
@@ -179,6 +182,10 @@ def generate_recommendation(
     fallback_note:     str        = "",
     intent:            dict | None = None,
     is_recommendation: bool        = False,
+    is_compare:        bool        = False,
+    is_size_guide:     bool        = False,
+    is_related:        bool        = False,
+    is_budget:         bool        = False,
 ) -> dict:
     """
     Call OpenAI to write a structured, reasoning-based recommendation.
@@ -226,8 +233,42 @@ def generate_recommendation(
         user_content += f"{intent_block}\n\n"
     user_content += f"Matching products:\n{products_text}"
 
-    # Framing instructions for special modes
-    if is_recommendation:
+    # ── Mode-specific framing ─────────────────────────────────────────────────
+    if is_compare:
+        user_content += (
+            "\n\nNote: The customer wants to COMPARE products. "
+            "Structure your answer as a clear comparison — highlight key differences "
+            "in price, color/style, brand, and stock. "
+            "End with a concise recommendation: 'If you want X, go with [Product A]. "
+            "If you prefer Y, choose [Product B].'"
+        )
+    elif is_size_guide:
+        sizes = sorted(results_df["size"].dropna().unique().tolist()) if not results_df.empty else []
+        sizes_str = ", ".join(str(s) for s in sizes) if sizes else "check the product page"
+        user_content += (
+            f"\n\nNote: The customer needs SIZE GUIDANCE. "
+            f"Available sizes: {sizes_str}. "
+            "Provide practical advice: mention the available sizes, suggest going up a size "
+            "if between sizes, and note that fit can vary by brand. "
+            "Be specific and helpful — don't just say 'check the size chart'."
+        )
+    elif is_related:
+        user_content += (
+            "\n\nNote: The customer wants SIMILAR or ALTERNATIVE products. "
+            "Present these as great alternatives. For each, briefly say what makes it "
+            "similar to what they described. "
+            "Start with: 'Here are some similar options you might love!'"
+        )
+    elif is_budget:
+        budget = intent.get("max_price", 0) if intent else 0
+        fitting = results_df[results_df["price"] <= budget] if not results_df.empty and budget else results_df
+        user_content += (
+            f"\n\nNote: The customer has a BUDGET of ${budget:.0f}. "
+            f"{len(fitting)} of the products shown fit within their budget. "
+            "For each product, clearly state the price and confirm it's within budget. "
+            "End your answer with how many options fit their budget."
+        )
+    elif is_recommendation:
         user_content += (
             "\n\nNote: The customer asked for general recommendations, not a "
             "specific filtered search. Present these as popular or curated picks. "
@@ -235,7 +276,9 @@ def generate_recommendation(
             "'Here are some popular products you might love!' or "
             "'Here are my top picks for you today!'"
         )
-    elif fallback_note == "exact match":
+
+    # ── Fallback note (can stack with mode framing) ───────────────────────────
+    if fallback_note == "exact match":
         user_content += (
             "\n\nNote: No exact match was found. These are the closest alternatives. "
             "Start your answer with: 'We couldn't find an exact match, "
@@ -340,6 +383,16 @@ def ask_assistant(
     if use_recommendation_mode:
         print("[assistant] Recommendation mode — skipping strict filters, ranking by popularity/semantics.")
 
+    # ── Step 1d: Detect special query modes ──────────────────────────────────
+    use_compare_mode    = is_compare_query(user_message)
+    use_size_guide_mode = is_size_guide_query(user_message)
+    use_related_mode    = is_related_query(user_message)
+    use_budget_mode     = is_budget_query(user_message) and bool(intent.get("max_price"))
+    if use_compare_mode:    print("[assistant] Compare mode — customer wants product comparison.")
+    if use_size_guide_mode: print("[assistant] Size guide mode — customer needs sizing help.")
+    if use_related_mode:    print("[assistant] Related mode — customer wants similar products.")
+    if use_budget_mode:     print("[assistant] Budget mode — customer stated explicit budget.")
+
     # ── Step 2: Semantic search — get candidate product IDs ─────────────────
     semantic_ids = []
     if embeddings_ready():
@@ -391,6 +444,10 @@ def ask_assistant(
             fallback_note      = fallback_note,
             intent             = intent,
             is_recommendation  = use_recommendation_mode,
+            is_compare         = use_compare_mode,
+            is_size_guide      = use_size_guide_mode,
+            is_related         = use_related_mode,
+            is_budget          = use_budget_mode,
         )
     except Exception as e:
         # If the OpenAI call fails, generate data-driven reasons without AI

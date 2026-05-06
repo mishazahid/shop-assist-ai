@@ -201,7 +201,22 @@ const s = {
     cursor: 'pointer',
     transition: 'border-color 0.15s, background 0.15s',
   },
+  // ── Branding footer ───────────────────────────────────────────────────────────
+  brandingRow: {
+    fontSize: '11px',
+    color: '#9ca3af',
+    padding: '6px 14px 10px',
+    textAlign: 'right',
+    borderTop: '1px solid #f3f4f6',
+  },
 }
+
+// Toggle for "Powered by ShopAssist AI" footer.
+// Merchants can set VITE_SHOW_BRANDING=false in frontend/.env to hide it.
+const SHOW_BRANDING =
+  typeof import.meta !== 'undefined' &&
+  import.meta.env &&
+  import.meta.env.VITE_SHOW_BRANDING !== 'false'
 
 // ── Bounce animation injected once ────────────────────────────────────────────
 const ANIM_CSS = `
@@ -240,13 +255,58 @@ export default function ChatWidget() {
   const [dropdownItems, setDropdownItems] = useState([])   // filtered for current input
   const [showDropdown,  setShowDropdown]  = useState(false)
 
-  // Stable session ID — generated once per page load, never changes.
-  // Sent with every /chat request so the backend can merge follow-up intents.
+  // Stable session ID — persisted in localStorage so multi-turn context
+  // survives page refreshes. Sent with every /chat request so the backend
+  // can merge follow-up intents.
   const sessionId = useRef(
-    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-      ? crypto.randomUUID()
-      : Math.random().toString(36).slice(2) + Date.now().toString(36)
+    (() => {
+      // SSR guard
+      if (typeof window === 'undefined') {
+        return (
+          (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : Math.random().toString(36).slice(2) + Date.now().toString(36))
+        )
+      }
+      try {
+        const existing = localStorage.getItem('shopassist-session-id')
+        if (existing && typeof existing === 'string') return existing
+      } catch {
+        // ignore and fall through to generating a fresh ID
+      }
+
+      const fresh =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : Math.random().toString(36).slice(2) + Date.now().toString(36)
+
+      try {
+        localStorage.setItem('shopassist-session-id', fresh)
+      } catch {
+        // ignore write errors (private / blocked storage)
+      }
+      return fresh
+    })()
   )
+
+  // Load conversation history from localStorage on first mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('shopassist-chat-history')
+      if (saved) {
+        const parsed = JSON.parse(saved)
+        if (Array.isArray(parsed) && parsed.length > 0) setMessages(parsed.slice(-50))
+      }
+    } catch {}
+  }, [])
+
+  // Persist messages to localStorage whenever they change
+  useEffect(() => {
+    if (messages.length === 0) return
+    try {
+      localStorage.setItem('shopassist-chat-history', JSON.stringify(messages.slice(-50)))
+    } catch {}
+  }, [messages])
 
   // Auto-scroll to the latest message
   useEffect(() => {
@@ -283,6 +343,12 @@ export default function ChatWidget() {
     setInput(term)
     setShowDropdown(false)
     inputRef.current?.focus()
+  }
+
+  const handleClearChat = () => {
+    setMessages([])
+    setError(null)
+    try { localStorage.removeItem('shopassist-chat-history') } catch {}
   }
 
   const handleSend = async (text) => {
@@ -478,6 +544,19 @@ export default function ChatWidget() {
           ↑
         </button>
       </div>
+      {SHOW_BRANDING && (
+        <div style={s.brandingRow}>
+          Powered by{' '}
+          <a
+            href="https://shopassist.ai"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: '#6b7280', textDecoration: 'none', fontWeight: 500 }}
+          >
+            ShopAssist AI
+          </a>
+        </div>
+      )}
     </div>
   )
 }

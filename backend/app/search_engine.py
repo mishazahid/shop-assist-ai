@@ -294,22 +294,61 @@ def is_vague_query(text: str) -> bool:
     """
     Return True if the query is a general recommendation / discovery request
     rather than a specific product search.
-
-    Called before intent extraction so the pipeline can skip hard filters
-    for queries like "recommend something stylish" or "what's popular".
-
-    Examples that return True:
-      "recommend something stylish"
-      "what's popular right now"
-      "suggest something nice"
-      "show me your best products"
-
-    Examples that return False (specific filters present):
-      "black Nike shoes under $100"
-      "Adidas hoodie in size M"
     """
     lower = text.lower().strip()
     return any(kw in lower for kw in _VAGUE_KEYWORDS)
+
+
+_COMPARE_KEYWORDS = {
+    "compare", " vs ", " vs.", "versus", "difference between",
+    "which is better", "which should i buy", "compare between",
+    "which one should i get", "which one is",
+}
+
+
+def is_compare_query(text: str) -> bool:
+    """Return True if the customer wants to compare two or more products."""
+    lower = text.lower()
+    return any(kw in lower for kw in _COMPARE_KEYWORDS)
+
+
+_SIZE_GUIDE_KEYWORDS = {
+    "what size", "which size", "size guide", "size chart",
+    "what size should", "help me with size", "fit guide",
+    "size recommendation", "am i a size", "what size am i",
+    "should i size up", "should i size down",
+}
+
+
+def is_size_guide_query(text: str) -> bool:
+    """Return True if the customer is asking for sizing help."""
+    lower = text.lower()
+    return any(kw in lower for kw in _SIZE_GUIDE_KEYWORDS)
+
+
+_RELATED_KEYWORDS = {
+    "similar to", "like this", "more like", "find similar",
+    "alternatives to", "other options", "something like",
+    "same as", "show me similar", "looks like",
+}
+
+
+def is_related_query(text: str) -> bool:
+    """Return True if the customer wants similar or alternative products."""
+    lower = text.lower()
+    return any(kw in lower for kw in _RELATED_KEYWORDS)
+
+
+_BUDGET_KEYWORDS = {
+    "i have $", "my budget is", "budget of $", "can spend",
+    "i have a budget", "price range", "i can afford", "spend up to",
+}
+
+
+def is_budget_query(text: str) -> bool:
+    """Return True if the customer explicitly stated a spending budget."""
+    lower = text.lower()
+    return any(kw in lower for kw in _BUDGET_KEYWORDS) and any(c.isdigit() for c in text)
 
 
 def recommend_products(

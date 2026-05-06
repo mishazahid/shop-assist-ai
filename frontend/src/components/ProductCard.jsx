@@ -11,13 +11,17 @@
 import { useState } from 'react'
 import { addToCart } from '../api'
 
-// Shopify store URL for "View Product" links.
-// Set VITE_SHOPIFY_STORE_URL in frontend/.env — empty string works inside a theme.
-const STORE_URL = (import.meta.env.VITE_SHOPIFY_STORE_URL || '').replace(/\/$/, '')
+// When embedded as a widget on a Shopify store, window.location.origin IS the store URL.
+// VITE_SHOPIFY_STORE_URL overrides this for standalone (non-embedded) deployments.
+const STORE_URL = (
+  import.meta.env.VITE_SHOPIFY_STORE_URL ||
+  (typeof window !== 'undefined' ? window.location.origin : '')
+).replace(/\/$/, '')
 
 export default function ProductCard({ product }) {
-  const [cartState, setCartState] = useState('idle') // idle | loading | success | error
-  const [errorMsg,  setErrorMsg]  = useState('')
+  const [cartState,    setCartState]    = useState('idle') // idle | loading | success | error
+  const [errorMsg,     setErrorMsg]     = useState('')
+  const [notifyState,  setNotifyState]  = useState('idle') // idle | saved
 
   if (!product) return null
 
@@ -28,6 +32,27 @@ export default function ProductCard({ product }) {
   const stockColor = inStock ? '#dcfce7' : '#fee2e2'
   const stockText  = inStock ? '#166534' : '#991b1b'
   const stockLabel = inStock ? `✓ ${product.inventory} in stock` : 'Out of stock'
+
+  // ── Notify Me (out-of-stock) ──────────────────────────────────────────────
+  const handleNotifyMe = () => {
+    try {
+      const key    = 'shopassist-alerts'
+      const alerts = JSON.parse(localStorage.getItem(key) || '[]')
+      const id     = String(product.variant_id || product.product_id || '')
+      if (!alerts.some(a => a.id === id)) {
+        alerts.push({
+          id,
+          title: product.product_title,
+          size:  product.size,
+          color: product.color,
+          ts:    Date.now(),
+        })
+        localStorage.setItem(key, JSON.stringify(alerts))
+      }
+      setNotifyState('saved')
+      setTimeout(() => setNotifyState('idle'), 3000)
+    } catch {}
+  }
 
   // ── Add to Cart ───────────────────────────────────────────────────────────
   const handleAddToCart = async () => {
@@ -165,6 +190,21 @@ export default function ProductCard({ product }) {
             </a>
           )}
         </div>
+
+        {/* Notify Me — shown for out-of-stock items */}
+        {!inStock && (
+          <button
+            onClick={handleNotifyMe}
+            style={{
+              ...st.cartBtn,
+              background: notifyState === 'saved' ? '#16a34a' : '#f3f4f6',
+              color:      notifyState === 'saved' ? '#ffffff' : '#374151',
+              cursor:     'pointer',
+            }}
+          >
+            {notifyState === 'saved' ? '✓ Saved! Check back soon' : '🔔 Notify Me'}
+          </button>
+        )}
 
         {/* Cart error message */}
         {cartState === 'error' && errorMsg && (
