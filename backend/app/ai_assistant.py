@@ -278,7 +278,21 @@ def generate_recommendation(
         )
 
     # ── Fallback note (can stack with mode framing) ───────────────────────────
-    if fallback_note == "exact match":
+    if fallback_note == "no_category":
+        # Store doesn't carry this product type at all — show unrelated alternatives
+        searched_for = ""
+        if intent:
+            searched_for = intent.get("keyword") or intent.get("category") or ""
+        what = f" {searched_for}" if searched_for else ""
+        user_content += (
+            f"\n\nNote: Our store does not carry{what}. "
+            "These are other products from our catalog that the customer might enjoy instead. "
+            "Start your answer by honestly saying we don't carry what they asked for, "
+            "then present these as other items worth exploring. "
+            "Do NOT say 'similar options' — these are different product types. "
+            "Be friendly and suggest they browse what we do have."
+        )
+    elif fallback_note == "exact match":
         user_content += (
             "\n\nNote: No exact match was found. These are the closest alternatives. "
             "Start your answer with: 'We couldn't find an exact match, "
