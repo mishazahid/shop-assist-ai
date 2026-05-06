@@ -376,10 +376,20 @@ def ask_assistant(
     # Fields not mentioned (None in new intent) are carried over from memory.
     # Example: previous={color:"black", category:"shoes"}, new={max_price:100}
     #          merged  ={color:"black", category:"shoes",  max_price:100}
-    if previous_intent:
+    #
+    # Exception: vague/general queries ("suggest something", "recommend anything")
+    # with no explicit filters are treated as a fresh start — don't carry over
+    # previous brand/size/color from an unrelated prior search.
+    new_has_filters = any([
+        intent.get("keyword"), intent.get("vendor"),  intent.get("category"),
+        intent.get("color"),   intent.get("size"),    intent.get("max_price"),
+    ])
+    if previous_intent and not (is_vague_query(user_message) and not new_has_filters):
         intent = merge_intents(previous_intent, intent)
         print(f"[assistant] Merged intent (previous + new): {intent}")
     else:
+        if previous_intent:
+            print(f"[assistant] Vague query with no filters — skipping merge, fresh recommendation.")
         print(f"[assistant] Intent: {intent}")
 
     # ── Step 1c: Detect recommendation / discovery mode ──────────────────────
