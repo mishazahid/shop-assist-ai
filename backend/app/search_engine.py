@@ -273,6 +273,27 @@ def search_with_fallback(
     if not df.empty:
         return df, "exact match"
 
+    # ── Level 5: drop category — store may not carry that product type ────────
+    # e.g. customer asks for "dress" but store only sells shoes/accessories.
+    # Keep vendor so we don't silently switch brands.
+    if category is not None:
+        print("[search] No results — dropping category filter, showing closest alternatives.")
+        df = search_products(
+            variants_df          = variants_df,
+            products_df          = products_df,
+            keyword              = keyword,
+            vendor               = vendor,
+            category             = None,
+            max_price            = None,
+            size                 = None,
+            color                = None,
+            in_stock_only        = in_stock_only,
+            top_n                = top_n,
+            semantic_product_ids = None,
+        )
+        if not df.empty:
+            return df, "exact match"
+
     # Nothing at all — return empty so AI can say "sorry, nothing found"
     return df, "exact match"
 

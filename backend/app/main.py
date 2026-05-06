@@ -110,7 +110,9 @@ async def lifespan(app: FastAPI):
     # Auto-sync from Shopify so the widget works without manual intervention.
     if _products_df.empty:
         shopify_domain = os.getenv("SHOPIFY_STORE_DOMAIN", "")
-        shopify_token  = os.getenv("SHOPIFY_ACCESS_TOKEN", "")
+        # NOTE: the Shopify Admin API token env var used by shopify_client.py
+        # is named SHOPIFY_ADMIN_TOKEN (not SHOPIFY_ACCESS_TOKEN).
+        shopify_token  = os.getenv("SHOPIFY_ADMIN_TOKEN", "")
         if shopify_domain and shopify_token:
             print("[startup] No CSV found — auto-syncing from Shopify…")
             try:

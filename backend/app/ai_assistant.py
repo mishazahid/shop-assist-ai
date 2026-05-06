@@ -436,6 +436,11 @@ def ask_assistant(
     print(f"[assistant] Search returned {len(results_df)} products.")
 
     # ── Step 4: Generate AI reasoning response ──────────────────────────────
+    # When there are truly no results, clear the fallback note so the AI uses
+    # the system prompt's "empty list" rule instead of "here are similar options".
+    if results_df.empty:
+        fallback_note = ""
+
     try:
         # Pass intent so the AI can write targeted, factual reasons for each product
         ai_response = generate_recommendation(
