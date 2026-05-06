@@ -59,6 +59,7 @@ export default function App() {
           >
             {syncing ? '⟳ Syncing…' : '⟳ Sync Products'}
           </button>
+          <a href="/admin" style={styles.adminLink}>⚙ Admin</a>
         </div>
       </header>
 
@@ -161,6 +162,15 @@ const styles = {
     color: '#374151',
     cursor: 'pointer',
     transition: 'background 0.15s',
+  },
+  adminLink: {
+    padding: '7px 14px',
+    background: '#111827',
+    borderRadius: '8px',
+    fontSize: '13px',
+    fontWeight: '500',
+    color: '#ffffff',
+    textDecoration: 'none',
   },
 
   // Sync banner

@@ -18,13 +18,16 @@ Run locally:
 """
 
 import os
+import hmac
+import hashlib
+import base64
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import time
 import requests as http_requests   # renamed to avoid collision with FastAPI
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -39,9 +42,15 @@ from app.search_engine     import (
     get_all_vendors, get_all_categories, get_all_colors,
 )
 from app.ai_assistant      import ask_assistant
-from app.embedding_service import build_product_embeddings   # NEW: semantic search index
+from app.embedding_service import build_product_embeddings
+from app.analytics         import init_db, log_query, get_recent_queries, get_total_count, get_summary
+from app.widget_config     import load as load_widget_config, save as save_widget_config
 
 load_dotenv()
+
+# ── Admin & webhook secrets ────────────────────────────────────────────────────
+ADMIN_API_KEY        = os.getenv("ADMIN_API_KEY", "")
+SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "")
 
 # ── In-memory data store ───────────────────────────────────────────────────────
 # DataFrames are loaded once at startup and reused for every request.
@@ -104,6 +113,7 @@ async def lifespan(app: FastAPI):
     """
     global _products_df, _variants_df
 
+    init_db()   # create analytics SQLite tables if they don't exist
     _load_data()
 
     # Railway has ephemeral storage — the CSV is gone on every restart.
@@ -370,6 +380,7 @@ def chat(req: ChatRequest):
         else:
             print(f"[session] New session: {req.session_id[:8]}…")
 
+    t_start = time.time()
     try:
         result = ask_assistant(
             user_message    = req.message,
@@ -382,6 +393,17 @@ def chat(req: ChatRequest):
         # Save the merged intent back to session memory for the next turn
         if req.session_id and result.get("_intent"):
             _save_session_intent(req.session_id, result["_intent"])
+
+        # Log to analytics
+        log_query(
+            session_id     = req.session_id,
+            message        = req.message,
+            intent         = result.get("_intent"),
+            products_found = len(result.get("products", [])),
+            was_answered   = len(result.get("products", [])) > 0,
+            fallback_used  = result.get("fallback_used", False),
+            response_ms    = int((time.time() - t_start) * 1000),
+        )
 
         # Strip the internal _intent field before sending to the frontend
         result.pop("_intent", None)
@@ -437,3 +459,119 @@ def cart_add(req: CartAddRequest):
 
     print(f"[cart] Added variant {req.variant_id} × {req.quantity} to cart.")
     return resp.json()
+
+
+# ── Widget config (public) ────────────────────────────────────────────────────
+
+@app.get("/widget-config")
+def widget_config():
+    """Return current widget appearance settings. Called by the frontend on load."""
+    return load_widget_config()
+
+
+# ── Admin auth dependency ─────────────────────────────────────────────────────
+
+def _require_admin(
+    x_admin_key: Optional[str] = Header(None),
+    admin_key:   Optional[str] = Query(None),
+):
+    key = x_admin_key or admin_key
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=503, detail="ADMIN_API_KEY not configured.")
+    if key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid admin key.")
+
+
+# ── Admin: analytics ──────────────────────────────────────────────────────────
+
+@app.get("/admin/analytics", dependencies=[Depends(_require_admin)])
+def admin_analytics():
+    """Return aggregated analytics: totals, top categories/brands, unanswered queries."""
+    return get_summary()
+
+
+@app.get("/admin/queries", dependencies=[Depends(_require_admin)])
+def admin_queries(limit: int = 100, offset: int = 0):
+    """Return paginated raw query log (most recent first)."""
+    return {
+        "total":   get_total_count(),
+        "queries": get_recent_queries(limit=limit, offset=offset),
+    }
+
+
+# ── Admin: widget config ──────────────────────────────────────────────────────
+
+@app.get("/admin/widget-config", dependencies=[Depends(_require_admin)])
+def admin_get_widget_config():
+    return load_widget_config()
+
+
+class WidgetConfigUpdate(BaseModel):
+    primaryColor: Optional[str]  = None
+    position:     Optional[str]  = None
+    title:        Optional[str]  = None
+    subtitle:     Optional[str]  = None
+    welcomeMsg:   Optional[str]  = None
+    showBranding: Optional[bool] = None
+
+
+@app.post("/admin/widget-config", dependencies=[Depends(_require_admin)])
+def admin_save_widget_config(body: WidgetConfigUpdate):
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    return save_widget_config(updates)
+
+
+# ── Shopify webhooks ──────────────────────────────────────────────────────────
+
+class WebhookRequest(BaseModel):
+    pass   # body is raw bytes; we validate via HMAC
+
+
+def _verify_shopify_hmac(body: bytes, hmac_header: str) -> bool:
+    if not SHOPIFY_WEBHOOK_SECRET:
+        return True   # skip verification if secret not configured (dev mode)
+    digest = base64.b64encode(
+        hmac.new(SHOPIFY_WEBHOOK_SECRET.encode(), body, hashlib.sha256).digest()
+    ).decode()
+    return hmac.compare_digest(digest, hmac_header)
+
+
+from fastapi import Request as FastAPIRequest
+
+@app.post("/webhooks/shopify")
+async def shopify_webhook(
+    request:               FastAPIRequest,
+    x_shopify_hmac_sha256: Optional[str] = Header(None),
+    x_shopify_topic:       Optional[str] = Header(None),
+):
+    """
+    Receive Shopify product webhooks and trigger an auto-sync.
+
+    Register these topics in Shopify Admin → Settings → Notifications → Webhooks:
+      products/create   →  https://your-railway-url/webhooks/shopify
+      products/update   →  https://your-railway-url/webhooks/shopify
+      products/delete   →  https://your-railway-url/webhooks/shopify
+
+    Set SHOPIFY_WEBHOOK_SECRET in Railway env vars to enable HMAC verification.
+    """
+    global _products_df, _variants_df
+
+    body = await request.body()
+
+    if x_shopify_hmac_sha256 and not _verify_shopify_hmac(body, x_shopify_hmac_sha256):
+        raise HTTPException(status_code=401, detail="Invalid HMAC — webhook rejected.")
+
+    topic = x_shopify_topic or "unknown"
+    print(f"[webhook] Shopify topic: {topic} — triggering re-sync…")
+
+    try:
+        raw          = fetch_all_products()
+        _products_df = clean_products(raw)
+        _variants_df = clean_variants(raw)
+        save_to_csv(_products_df, _variants_df)
+        build_product_embeddings(_products_df)
+        print(f"[webhook] Re-sync complete: {len(_products_df)} products, {len(_variants_df)} variants.")
+    except Exception as exc:
+        print(f"[webhook] Re-sync failed: {exc}")
+
+    return {"status": "ok", "topic": topic}
