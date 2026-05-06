@@ -27,7 +27,7 @@ from typing import Optional
 import time
 import requests as http_requests   # renamed to avoid collision with FastAPI
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Header, Query, Depends
+from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -469,28 +469,15 @@ def widget_config():
     return load_widget_config()
 
 
-# ── Admin auth dependency ─────────────────────────────────────────────────────
-
-def _require_admin(
-    x_admin_key: Optional[str] = Header(None),
-    admin_key:   Optional[str] = Query(None),
-):
-    key = x_admin_key or admin_key
-    if not ADMIN_API_KEY:
-        raise HTTPException(status_code=503, detail="ADMIN_API_KEY not configured.")
-    if key != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid admin key.")
-
-
 # ── Admin: analytics ──────────────────────────────────────────────────────────
 
-@app.get("/admin/analytics", dependencies=[Depends(_require_admin)])
+@app.get("/admin/analytics")
 def admin_analytics():
     """Return aggregated analytics: totals, top categories/brands, unanswered queries."""
     return get_summary()
 
 
-@app.get("/admin/queries", dependencies=[Depends(_require_admin)])
+@app.get("/admin/queries")
 def admin_queries(limit: int = 100, offset: int = 0):
     """Return paginated raw query log (most recent first)."""
     return {
@@ -501,7 +488,7 @@ def admin_queries(limit: int = 100, offset: int = 0):
 
 # ── Admin: widget config ──────────────────────────────────────────────────────
 
-@app.get("/admin/widget-config", dependencies=[Depends(_require_admin)])
+@app.get("/admin/widget-config")
 def admin_get_widget_config():
     return load_widget_config()
 
@@ -515,7 +502,7 @@ class WidgetConfigUpdate(BaseModel):
     showBranding: Optional[bool] = None
 
 
-@app.post("/admin/widget-config", dependencies=[Depends(_require_admin)])
+@app.post("/admin/widget-config")
 def admin_save_widget_config(body: WidgetConfigUpdate):
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     return save_widget_config(updates)

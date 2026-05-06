@@ -16,9 +16,8 @@ const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
 // ── API helpers ───────────────────────────────────────────────────────────────
 
-async function adminFetch(path, key, options = {}) {
-  const sep = path.includes('?') ? '&' : '?'
-  const res = await fetch(`${BASE_URL}${path}${sep}admin_key=${encodeURIComponent(key)}`, {
+async function adminFetch(path, options = {}) {
+  const res = await fetch(`${BASE_URL}${path}`, {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   })
@@ -68,41 +67,22 @@ function BarChart({ title, rows }) {
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function AdminDashboard() {
-  const [adminKey,   setAdminKey]   = useState(() => localStorage.getItem('shopassist-admin-key') || '')
-  const [authed,     setAuthed]     = useState(false)
-  const [authErr,    setAuthErr]    = useState('')
-  const [tab,        setTab]        = useState('queries')
+  const [tab, setTab] = useState('queries')
 
-  // Queries tab
-  const [queries,    setQueries]    = useState([])
-  const [qTotal,     setQTotal]     = useState(0)
-  const [qOffset,    setQOffset]    = useState(0)
-  const [qLoading,   setQLoading]   = useState(false)
-
-  // Analytics tab
-  const [summary,    setSummary]    = useState(null)
-  const [aLoading,   setALoading]   = useState(false)
-
-  // Widget config tab
-  const [config,     setConfig]     = useState(null)
-  const [cfgSaving,  setCfgSaving]  = useState(false)
-  const [cfgMsg,     setCfgMsg]     = useState('')
-
-  const handleLogin = async () => {
-    setAuthErr('')
-    try {
-      await adminFetch('/admin/analytics', adminKey)
-      localStorage.setItem('shopassist-admin-key', adminKey)
-      setAuthed(true)
-    } catch (e) {
-      setAuthErr(e.message)
-    }
-  }
+  const [queries,   setQueries]  = useState([])
+  const [qTotal,    setQTotal]   = useState(0)
+  const [qOffset,   setQOffset]  = useState(0)
+  const [qLoading,  setQLoading] = useState(false)
+  const [summary,   setSummary]  = useState(null)
+  const [aLoading,  setALoading] = useState(false)
+  const [config,    setConfig]   = useState(null)
+  const [cfgSaving, setCfgSaving]= useState(false)
+  const [cfgMsg,    setCfgMsg]   = useState('')
 
   const loadQueries = useCallback(async (offset = 0) => {
     setQLoading(true)
     try {
-      const data = await adminFetch(`/admin/queries?limit=50&offset=${offset}`, adminKey)
+      const data = await adminFetch(`/admin/queries?limit=50&offset=${offset}`)
       setQueries(data.queries || [])
       setQTotal(data.total || 0)
       setQOffset(offset)
@@ -111,41 +91,40 @@ export default function AdminDashboard() {
     } finally {
       setQLoading(false)
     }
-  }, [adminKey])
+  }, [])
 
   const loadAnalytics = useCallback(async () => {
     setALoading(true)
     try {
-      const data = await adminFetch('/admin/analytics', adminKey)
+      const data = await adminFetch('/admin/analytics')
       setSummary(data)
     } catch (e) {
       console.error(e)
     } finally {
       setALoading(false)
     }
-  }, [adminKey])
+  }, [])
 
   const loadConfig = useCallback(async () => {
     try {
-      const data = await adminFetch('/admin/widget-config', adminKey)
+      const data = await adminFetch('/admin/widget-config')
       setConfig(data)
     } catch (e) {
       console.error(e)
     }
-  }, [adminKey])
+  }, [])
 
   useEffect(() => {
-    if (!authed) return
     if (tab === 'queries')   loadQueries(0)
     if (tab === 'analytics') loadAnalytics()
     if (tab === 'widget')    loadConfig()
-  }, [authed, tab, loadQueries, loadAnalytics, loadConfig])
+  }, [tab, loadQueries, loadAnalytics, loadConfig])
 
   const saveConfig = async () => {
     setCfgSaving(true)
     setCfgMsg('')
     try {
-      const saved = await adminFetch('/admin/widget-config', adminKey, {
+      const saved = await adminFetch('/admin/widget-config', {
         method: 'POST',
         body: JSON.stringify(config),
       })
@@ -159,35 +138,6 @@ export default function AdminDashboard() {
     }
   }
 
-  // ── Login screen ─────────────────────────────────────────────────────────
-  if (!authed) {
-    return (
-      <div style={st.loginPage}>
-        <div style={st.loginCard}>
-          <div style={{ fontSize: 32, marginBottom: 8 }}>🛍️</div>
-          <h2 style={st.loginTitle}>ShopAssist Admin</h2>
-          <p style={st.loginSub}>Enter your admin key to continue</p>
-          <input
-            style={st.loginInput}
-            type="password"
-            placeholder="Admin key"
-            value={adminKey}
-            onChange={e => setAdminKey(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && handleLogin()}
-            autoFocus
-          />
-          {authErr && <div style={st.loginErr}>⚠️ {authErr}</div>}
-          <button style={st.loginBtn} onClick={handleLogin}>
-            Sign In →
-          </button>
-          <div style={st.loginHint}>
-            Set <code>ADMIN_API_KEY</code> in your Railway environment variables.
-          </div>
-        </div>
-      </div>
-    )
-  }
-
   // ── Dashboard ─────────────────────────────────────────────────────────────
   return (
     <div style={st.page}>
@@ -199,9 +149,6 @@ export default function AdminDashboard() {
         </div>
         <div style={st.headerRight}>
           <a href="/" style={st.backLink}>← Back to widget</a>
-          <button style={st.logoutBtn} onClick={() => { setAuthed(false); localStorage.removeItem('shopassist-admin-key') }}>
-            Sign out
-          </button>
         </div>
       </header>
 
