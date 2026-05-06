@@ -130,24 +130,36 @@ def merge_intents(previous: dict, new: dict) -> dict:
     """
     Combine a previous intent with a newly extracted one.
 
-    Rule: only override a field if the new query explicitly mentioned it
-    (i.e. the field is not None in `new`).  Fields the user didn't mention
-    in the follow-up are kept from the previous turn.
+    Two cases:
 
-    Examples
-    --------
-    previous = {color: "black", category: "shoes", max_price: None}
-    new      = {max_price: 100,  everything else: None}
-    merged   = {color: "black", category: "shoes", max_price: 100}
+    REFINEMENT — user adds/changes a filter on the same product type.
+      previous = {color: "black", category: "shoes"}
+      new      = {max_price: 100}               ← no new keyword/category
+      merged   = {color: "black", category: "shoes", max_price: 100}
 
-    previous = {color: "black", category: "shoes"}
-    new      = {color: "white", category: "shoes"}
-    merged   = {color: "white", category: "shoes"}   ← user changed color
+    NEW SEARCH — user switches to a different product entirely.
+      previous = {color: "red", size: "M", category: "dresses"}
+      new      = {vendor: "Adidas", category: "shoes"}
+      merged   = {vendor: "Adidas", category: "shoes"}
+                  ← color, size, old vendor cleared; budget kept
+
+    The rule: if the new query mentions a keyword or category, treat it as
+    a new product context and reset color, size, and vendor so the old
+    product's filters don't bleed into the new search.  max_price is kept
+    because the user's budget hasn't changed between searches.
     """
     merged = previous.copy()
+
+    # New product context detected — clear per-product filters from the old search.
+    if new.get("keyword") is not None or new.get("category") is not None:
+        merged["color"]  = None
+        merged["size"]   = None
+        merged["vendor"] = None
+
     for key, value in new.items():
-        if value is not None:          # only override fields the user mentioned
+        if value is not None:
             merged[key] = value
+
     return merged
 
 
