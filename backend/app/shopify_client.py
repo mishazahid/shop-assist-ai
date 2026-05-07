@@ -96,6 +96,57 @@ def fetch_all_products() -> list[dict]:
     return all_products
 
 
+def _post(endpoint: str, payload: dict) -> requests.Response:
+    """Send a single authenticated POST request to the Shopify Admin API."""
+    url = f"{BASE_URL}{endpoint}"
+    response = requests.post(url, headers=HEADERS, json=payload, timeout=30)
+    response.raise_for_status()
+    return response
+
+
+def register_webhooks(callback_url: str) -> list[dict]:
+    """
+    Register the three product webhook topics with Shopify.
+
+    Shopify deduplicates by (topic, address), so calling this multiple times
+    is safe — it returns existing webhooks without creating duplicates.
+
+    Parameters
+    ----------
+    callback_url : str
+        The public URL of your backend, e.g. https://your-app.railway.app/webhooks/shopify
+    """
+    topics = ["products/create", "products/update", "products/delete"]
+    registered: list[dict] = []
+
+    # Fetch existing webhooks so we can skip already-registered ones
+    existing = {w["topic"] for w in list_webhooks()}
+
+    for topic in topics:
+        if topic in existing:
+            print(f"  Webhook already registered: {topic}")
+            continue
+        payload = {"webhook": {"topic": topic, "address": callback_url, "format": "json"}}
+        try:
+            resp = _post("/webhooks.json", payload)
+            webhook = resp.json().get("webhook", {})
+            registered.append(webhook)
+            print(f"  Registered webhook: {topic} → {callback_url}")
+        except Exception as exc:
+            print(f"  Failed to register {topic}: {exc}")
+
+    return registered
+
+
+def list_webhooks() -> list[dict]:
+    """Return all webhooks currently registered on the Shopify store."""
+    try:
+        resp = _get("/webhooks.json")
+        return resp.json().get("webhooks", [])
+    except Exception:
+        return []
+
+
 def _parse_next_link(link_header: str) -> str | None:
     """
     Parse Shopify's Link header and return the URL for rel="next", or None.

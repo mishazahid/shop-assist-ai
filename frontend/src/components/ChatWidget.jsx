@@ -349,6 +349,13 @@ export default function ChatWidget() {
     setMessages([])
     setError(null)
     try { localStorage.removeItem('shopassist-chat-history') } catch {}
+    // Generate a fresh session ID so the backend also starts with clean context
+    const fresh =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : Math.random().toString(36).slice(2) + Date.now().toString(36)
+    sessionId.current = fresh
+    try { localStorage.setItem('shopassist-session-id', fresh) } catch {}
   }
 
   const handleSend = async (text) => {
@@ -403,6 +410,24 @@ export default function ChatWidget() {
           <div style={s.headerTitle}>ShopAssist AI</div>
           <div style={s.headerSubtitle}>Ask me anything about our products</div>
         </div>
+        <button
+          onClick={handleClearChat}
+          title="Clear chat history"
+          style={{
+            background: 'rgba(255,255,255,0.15)',
+            border: 'none',
+            borderRadius: '6px',
+            color: '#ffffff',
+            fontSize: '12px',
+            padding: '4px 8px',
+            cursor: 'pointer',
+            flexShrink: 0,
+          }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.25)' }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.15)' }}
+        >
+          Clear
+        </button>
         <div
           style={{
             width: '8px', height: '8px', borderRadius: '50%',

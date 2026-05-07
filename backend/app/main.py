@@ -4,13 +4,16 @@ main.py
 FastAPI application — the backend for ShopAssist AI.
 
 Endpoints:
-  GET  /health          — health check (product / variant counts)
-  GET  /sync-products   — fetch from Shopify, clean, save CSV, rebuild embeddings
-  GET  /products        — return all products from CSV
-  GET  /variants        — return all variants from CSV
-  POST /search          — search products with structured filters
-  POST /chat            — AI-powered natural-language shopping assistant
-  POST /cart/add        — add a variant to the Shopify cart (proxy)
+  GET  /health              — health check (product / variant counts)
+  GET  /sync-products       — fetch from Shopify, clean, save CSV, rebuild embeddings
+  GET  /products            — return all products from CSV
+  GET  /variants            — return all variants from CSV
+  POST /search              — search products with structured filters
+  POST /chat                — AI-powered natural-language shopping assistant
+  POST /cart/add            — add a variant to the Shopify cart (proxy)
+  POST /webhooks/shopify    — Shopify product webhook receiver (auto-sync)
+  POST /webhooks/register   — register product webhooks with Shopify
+  GET  /webhooks/list       — list registered Shopify webhooks
 
 Run locally:
   cd backend
@@ -21,18 +24,19 @@ import os
 import hmac
 import hashlib
 import base64
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import time
 import requests as http_requests   # renamed to avoid collision with FastAPI
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Header, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from app.shopify_client    import fetch_all_products
+from app.shopify_client    import fetch_all_products, register_webhooks, list_webhooks
 from app.data_cleaner      import (
     clean_products, clean_variants,
     save_to_csv, load_from_csv, csv_exists,
@@ -65,6 +69,54 @@ _variants_df: pd.DataFrame = pd.DataFrame()
 _sessions: dict[str, dict] = {}
 SESSION_TTL  = 3600   # seconds — sessions expire after 1 hour of inactivity
 MAX_SESSIONS = 500    # cap to prevent unbounded memory growth
+
+# ── Background sync state ──────────────────────────────────────────────────────
+# Shopify webhooks must receive a 200 response within 5 s or they retry.
+# We respond immediately and run the actual sync in a thread.
+# _sync_lock prevents concurrent syncs; _sync_pending coalesces rapid events
+# so a burst of webhooks (e.g. bulk update) produces at most two syncs.
+_sync_lock    = threading.Lock()
+_sync_pending = False
+
+
+def _run_sync(topic: str) -> None:
+    """
+    Full catalog re-sync meant to run in a background thread.
+
+    Coalescing: if another webhook fires while this sync is running, it sets
+    _sync_pending = True instead of stacking another call.  After the current
+    sync finishes it checks _sync_pending and re-runs once if needed.
+    """
+    global _products_df, _variants_df, _sync_pending
+
+    if not _sync_lock.acquire(blocking=False):
+        # A sync is already running — mark pending so it re-runs after
+        _sync_pending = True
+        print(f"[webhook] Sync already in progress ({topic}) — will re-run after.")
+        return
+
+    try:
+        while True:
+            _sync_pending = False
+            print(f"[webhook] Background sync starting ({topic})…")
+            try:
+                raw          = fetch_all_products()
+                _products_df = clean_products(raw)
+                _variants_df = clean_variants(raw)
+                save_to_csv(_products_df, _variants_df)
+                build_product_embeddings(_products_df)
+                print(
+                    f"[webhook] Sync complete: "
+                    f"{len(_products_df)} products, {len(_variants_df)} variants."
+                )
+            except Exception as exc:
+                print(f"[webhook] Sync failed: {exc}")
+
+            if not _sync_pending:
+                break   # no further events queued — we're done
+            print("[webhook] Re-running sync for queued webhook event…")
+    finally:
+        _sync_lock.release()
 
 
 def _get_session_intent(session_id: str) -> dict | None:
@@ -144,6 +196,17 @@ async def lifespan(app: FastAPI):
         build_product_embeddings(_products_df)
     else:
         print("[startup] No products available. Call GET /sync-products to load data.")
+
+    # Auto-register Shopify webhooks if PUBLIC_URL is configured.
+    # Shopify deduplicates by (topic, address), so this is idempotent.
+    public_url = os.getenv("PUBLIC_URL", "").rstrip("/")
+    if public_url and os.getenv("SHOPIFY_ADMIN_TOKEN"):
+        callback = f"{public_url}/webhooks/shopify"
+        print(f"[startup] Registering Shopify webhooks → {callback}")
+        try:
+            register_webhooks(callback)
+        except Exception as exc:
+            print(f"[startup] Webhook registration failed: {exc}")
 
     yield   # Server is now running — yield until shutdown
 
@@ -528,37 +591,59 @@ from fastapi import Request as FastAPIRequest
 @app.post("/webhooks/shopify")
 async def shopify_webhook(
     request:               FastAPIRequest,
+    background_tasks:      BackgroundTasks,
     x_shopify_hmac_sha256: Optional[str] = Header(None),
     x_shopify_topic:       Optional[str] = Header(None),
 ):
     """
-    Receive Shopify product webhooks and trigger an auto-sync.
+    Receive Shopify product webhooks and trigger a background sync.
 
-    Register these topics in Shopify Admin → Settings → Notifications → Webhooks:
-      products/create   →  https://your-railway-url/webhooks/shopify
-      products/update   →  https://your-railway-url/webhooks/shopify
-      products/delete   →  https://your-railway-url/webhooks/shopify
+    Responds immediately (Shopify requires < 5 s) and runs the full catalog
+    sync in a background thread.  Concurrent events are coalesced — a burst
+    of webhooks (e.g. bulk product update) produces at most two syncs.
 
-    Set SHOPIFY_WEBHOOK_SECRET in Railway env vars to enable HMAC verification.
+    The easiest way to register these webhooks is to set PUBLIC_URL in your
+    Railway env vars — they are registered automatically on startup.
+    You can also call POST /webhooks/register manually.
     """
-    global _products_df, _variants_df
-
     body = await request.body()
 
     if x_shopify_hmac_sha256 and not _verify_shopify_hmac(body, x_shopify_hmac_sha256):
         raise HTTPException(status_code=401, detail="Invalid HMAC — webhook rejected.")
 
     topic = x_shopify_topic or "unknown"
-    print(f"[webhook] Shopify topic: {topic} — triggering re-sync…")
-
-    try:
-        raw          = fetch_all_products()
-        _products_df = clean_products(raw)
-        _variants_df = clean_variants(raw)
-        save_to_csv(_products_df, _variants_df)
-        build_product_embeddings(_products_df)
-        print(f"[webhook] Re-sync complete: {len(_products_df)} products, {len(_variants_df)} variants.")
-    except Exception as exc:
-        print(f"[webhook] Re-sync failed: {exc}")
+    print(f"[webhook] Received {topic} — queuing background sync…")
+    background_tasks.add_task(_run_sync, topic)
 
     return {"status": "ok", "topic": topic}
+
+
+@app.post("/webhooks/register")
+def webhooks_register(callback_url: str):
+    """
+    Register the three product webhook topics with Shopify.
+
+    Pass the full public URL of this server as `callback_url`, e.g.:
+      https://your-app.railway.app/webhooks/shopify
+
+    Alternatively, set PUBLIC_URL in your env vars — webhooks are then
+    registered automatically on every server startup.
+    """
+    try:
+        registered = register_webhooks(callback_url)
+        existing   = list_webhooks()
+        return {
+            "newly_registered": registered,
+            "all_webhooks":     existing,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/webhooks/list")
+def webhooks_list():
+    """Return all webhooks currently registered on the Shopify store."""
+    try:
+        return {"webhooks": list_webhooks()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
